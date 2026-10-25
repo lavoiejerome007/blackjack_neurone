@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 36
+names: ['Button3PotRaise', 'ButtonBet', 'ButtonCall', 'ButtonCheck', 'ButtonFold', 'ButtonMaxRaise', 'ButtonMinRaise', 'ButtonPotRaise', 'ButtonRaise', 'Chips', 'Dealer', 'HiddenCards', 'Player', 'PlayerBet', 'PlayerChips', 'PlayingCards', 'Pot', 'PreButtonCall', 'PreButtonCallAny', 'PreButtonCheck', 'PreButtonCheckFold', 'PreButtonFold', 'PrincipalBet', 'PrincipalCards', 'PrincipalCards1', 'PrincipalCards2', 'PrincipalPlayer', 'PrincipalPlayerChips', 'ShowedCards', 'ShowedCards1', 'ShowedCards2', 'ShowedCards3', 'ShowedCards4', 'ShowedCards5', 'SmallBigBlind', 'TablePot']
+
+roboflow:
+  workspace: pokertest-a93pw
+  project: pokertable
+  version: 11
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/pokertest-a93pw/pokertable/dataset/11

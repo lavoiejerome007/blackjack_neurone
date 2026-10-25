@@ -5,28 +5,24 @@ import torch.nn as nn
 import copy
 
 # ==============================================================================
-# ⚙️ CONFIGURATION GLOBALE (SANS COMPTAGE DE CARTES)
+# ⚙️ CONFIGURATION GLOBALE DE LA NEURO-ÉVOLUTION
 # ==============================================================================
 EVO_CONFIG = {
-    "population_size": 100,         # Population de 100 individus
-    "input_size": 4,                # 4 entrées : Somme, Carte Croupier, As, Ratio Bankroll
-    "output_size": 4,               # 4 actions : 0: Stand, 1: Hit, 2: Double, 3: Split
-    "hidden_layers": [64, 64],      # Architecture MLP
+    "population_size": 60,
+    "input_size": 6,
+    "output_size": 4,
+    "hidden_layers": [64, 64],
     
-    # Paramètres génétiques (Mutation pure et élitisme fort)
-    "mutation_rate": 0.25,          # 25% de chance de mutation par poids
-    "mutation_strength": 0.2,       # Bruit gaussien doux
-    "crossover_rate": 0.0,          # 0% de croisement pour préserver les réseaux
-    "elite_fraction": 0.20          # Top 20% des meilleurs champions conservés intacts
+    "mutation_rate": 0.25,
+    "mutation_strength": 0.2,
+    "crossover_rate": 0.0,
+    "elite_fraction": 0.20
 }
 
 
-# ==============================================================================
-# 1. ARCHITECTURE DU RÉSEAU (4 ENTRÉES -> 4 ACTIONS + MISE)
-# ==============================================================================
-class BettingNeuralNetwork(nn.Module):
+class PokerNeuralNetwork(nn.Module):
     def __init__(self, input_size, output_size, hidden_layers):
-        super(BettingNeuralNetwork, self).__init__()
+        super(PokerNeuralNetwork, self).__init__()
         
         layers = []
         prev_size = input_size
@@ -36,12 +32,8 @@ class BettingNeuralNetwork(nn.Module):
             prev_size = hidden_size
             
         self.feature_extractor = nn.Sequential(*layers)
-        
-        # Tête 1 : Actions de jeu (Stand, Hit, Double, Split)
         self.action_head = nn.Linear(prev_size, output_size)
-        
-        # Tête 2 : Pourcentage de mise (Entre 0.0 et 1.0)
-        self.bet_head = nn.Sequential(
+        self.sizing_head = nn.Sequential(
             nn.Linear(prev_size, 1),
             nn.Sigmoid()
         )
@@ -49,39 +41,26 @@ class BettingNeuralNetwork(nn.Module):
     def forward(self, x):
         features = self.feature_extractor(x)
         q_values = self.action_head(features)
-        bet_pct = self.bet_head(features)
-        return q_values, bet_pct
+        sizing_pct = self.sizing_head(features)
+        return q_values, sizing_pct
 
 
-# ==============================================================================
-# 2. L'INDIVIDU
-# ==============================================================================
-class Individual:
+class PokerIndividual:
     def __init__(self, input_size, output_size, hidden_layers):
-        self.brain = BettingNeuralNetwork(input_size, output_size, hidden_layers)
+        self.brain = PokerNeuralNetwork(input_size, output_size, hidden_layers)
         self.fitness = 0.0
 
     def predict_action(self, inputs):
         self.brain.eval()
         with torch.no_grad():
             x = torch.FloatTensor(inputs).unsqueeze(0)
-            q_values, _ = self.brain(x)
-            return torch.argmax(q_values).item()
-
-    def predict_bet(self, inputs, min_bet, max_bet):
-        self.brain.eval()
-        with torch.no_grad():
-            x = torch.FloatTensor(inputs).unsqueeze(0)
-            _, bet_pct = self.brain(x)
-            pct = bet_pct.item()
-            montant = min_bet + pct * (max_bet - min_bet)
-            return round(montant, 2)
+            q_values, sizing_pct = self.brain(x)
+            action = torch.argmax(q_values).item()
+            pct = sizing_pct.item()
+            return action, pct
 
 
-# ==============================================================================
-# 3. MOTEUR ÉVOLUTIF
-# ==============================================================================
-class GeneticPopulation:
+class PokerGeneticPopulation:
     def __init__(self, config=EVO_CONFIG):
         self.config = config
         self.pop_size = config["population_size"]
@@ -90,7 +69,7 @@ class GeneticPopulation:
         self.hidden_layers = config["hidden_layers"]
         
         self.population = [
-            Individual(self.input_size, self.output_size, self.hidden_layers) 
+            PokerIndividual(self.input_size, self.output_size, self.hidden_layers) 
             for _ in range(self.pop_size)
         ]
         self.generation = 1
@@ -131,23 +110,17 @@ class GeneticPopulation:
             self.best_ever_fitness = self.population[0].fitness
             self.best_ever_brain = copy.deepcopy(self.population[0].brain)
 
-        print(f"--- Génération {self.generation} terminée ---")
-        print(f"Moyenne Générale : {self.last_gen_avg_fitness:.2f} | Moyenne Élites : {self.last_elite_avg_fitness:.2f} | Record : {self.best_ever_fitness:.2f}")
-
         nouvelle_generation = []
 
-        # Élitisme : Copie exacte
         for i in range(nb_elites):
-            elite_clone = Individual(self.input_size, self.output_size, self.hidden_layers)
+            elite_clone = PokerIndividual(self.input_size, self.output_size, self.hidden_layers)
             elite_clone.brain.load_state_dict(self.population[i].brain.state_dict())
             elite_clone.fitness = 0.0
             nouvelle_generation.append(elite_clone)
 
-        # Remplissage par Sélection & Mutation
         while len(nouvelle_generation) < self.pop_size:
             parent = self._selection_tournoi(k=5)
-            
-            enfant = Individual(self.input_size, self.output_size, self.hidden_layers)
+            enfant = PokerIndividual(self.input_size, self.output_size, self.hidden_layers)
             enfant.brain.load_state_dict(parent.brain.state_dict())
             
             self._mutate(enfant)

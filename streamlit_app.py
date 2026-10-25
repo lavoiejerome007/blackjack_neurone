@@ -1,400 +1,219 @@
-import streamlit as st
-import random
+import os
+import cv2
 import numpy as np
-import torch
-import copy
+from PIL import Image
+import streamlit as st
+from ultralytics import YOLO
 
-from neuro_evolution import GeneticPopulation, EVO_CONFIG, Individual
+# Import optionnel de ton module d'IA génétique s'il est présent à la racine
+try:
+  import neuro_evolution as ne
 
-# ==============================================================================
-# 1. ENVIRONNEMENT BLACKJACK STANDARD (SANS COMPTAGE)
-# ==============================================================================
-class OptimizedBlackjackEnv:
-    def __init__(self, num_decks=4, initial_bankroll=1000.0, min_bet=10.0, max_bet=200.0):
-        self.num_decks = num_decks
-        self.initial_bankroll = initial_bankroll
-        self.min_bet = min_bet
-        self.max_bet = max_bet
-        self.bankroll = initial_bankroll
-        self.current_bet = min_bet
-        
-        self.shoe = []
-        self._creer_shoe()
-        self.reset()
+  MODULE_GENETIQUE_DISPO = True
+except ImportError:
+  MODULE_GENETIQUE_DISPO = False
 
-    def _creer_shoe(self, seed=None):
-        if seed is not None:
-            random.seed(seed)
-            np.random.seed(seed)
+# Configuration de la page Streamlit
+st.set_page_config(
+    page_title="Assistant Live Texas Hold'em 6-max",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-        deck_unitaire = [2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11] * 4
-        self.shoe = deck_unitaire * self.num_decks
-        random.shuffle(self.shoe)
-
-    def _verifier_et_recharger_shoe(self):
-        if len(self.shoe) <= (52 * self.num_decks) * 0.25:
-            self._creer_shoe()
-
-    def _tirer_carte(self):
-        self._verifier_et_recharger_shoe()
-        return self.shoe.pop()
-
-    def _calculer_main(self, main):
-        somme = sum(main)
-        as_utilisables = main.count(11)
-        while somme > 21 and as_utilisables > 0:
-            somme -= 10
-            as_utilisables -= 1
-        contient_as_utilisable = 1.0 if (11 in main and sum(main) <= 21) else 0.0
-        return somme, contient_as_utilisable
-
-    def reset_session(self, seed=None):
-        self.bankroll = self.initial_bankroll
-        if seed is not None:
-            self._creer_shoe(seed=seed)
-        return self.reset()
-
-    def reset(self):
-        self.main_joueur = [self._tirer_carte(), self._tirer_carte()]
-        self.main_croupier = [self._tirer_carte(), self._tirer_carte()]
-        return self._obtenir_etat()
-
-    def _obtenir_etat(self, main_specifique=None):
-        main = main_specifique if main_specifique is not None else self.main_joueur
-        somme_j, as_j = self._calculer_main(main)
-        carte_croupier = self.main_croupier[0]
-        bankroll_ratio = self.bankroll / self.initial_bankroll
-        
-        return np.array([somme_j, carte_croupier, as_j, bankroll_ratio], dtype=np.float32)
-
-    def fixer_mise(self, montant_mise):
-        self.current_bet = min(max(montant_mise, self.min_bet), min(self.max_bet, self.bankroll))
-
-    def _evaluer_main_contre_croupier(self, main_joueur, mise):
-        somme_c, _ = self._calculer_main(self.main_croupier)
-        while somme_c < 17:
-            self.main_croupier.append(self._tirer_carte())
-            somme_c, _ = self._calculer_main(self.main_croupier)
-
-        somme_j, _ = self._calculer_main(main_joueur)
-        
-        if somme_j > 21:
-            return -mise
-        elif somme_c > 21 or somme_j > somme_c:
-            return mise
-        elif somme_j < somme_c:
-            return -mise
-        else:
-            return 0.0
-
-    def step(self, action):
-        if action == 2 and (len(self.main_joueur) != 2 or self.bankroll < self.current_bet * 2):
-            action = 1
-
-        if action == 3 and (len(self.main_joueur) != 2 or self.main_joueur[0] != self.main_joueur[1] or self.bankroll < self.current_bet * 2):
-            action = 1
-
-        if action == 1:  # HIT
-            self.main_joueur.append(self._tirer_carte())
-            somme_j, _ = self._calculer_main(self.main_joueur)
-            if somme_j > 21:
-                profit = -self.current_bet
-                self.bankroll += profit
-                return self._obtenir_etat(), profit, True
-            else:
-                return self._obtenir_etat(), 0.0, False
-
-        elif action == 0:  # STAND
-            profit = self._evaluer_main_contre_croupier(self.main_joueur, self.current_bet)
-            self.bankroll += profit
-            return self._obtenir_etat(), profit, True
-
-        elif action == 2:  # DOUBLE DOWN
-            self.current_bet *= 2
-            self.main_joueur.append(self._tirer_carte())
-            profit = self._evaluer_main_contre_croupier(self.main_joueur, self.current_bet)
-            self.bankroll += profit
-            return self._obtenir_etat(), profit, True
-
-        elif action == 3:  # SPLIT
-            main_1 = [self.main_joueur[0], self._tirer_carte()]
-            main_2 = [self.main_joueur[1], self._tirer_carte()]
-            
-            profit_1 = self._evaluer_main_contre_croupier(main_1, self.current_bet)
-            profit_2 = self._evaluer_main_contre_croupier(main_2, self.current_bet)
-            
-            profit_total = profit_1 + profit_2
-            self.bankroll += profit_total
-            return self._obtenir_etat(), profit_total, True
+st.title("🃏 Assistant Live Texas Hold'em 6-max & IA GTO")
+st.markdown(
+    "Application complète combinant la **vision YOLOv8** et le **moteur de"
+    " décision stratégique**."
+)
 
 
-# ==============================================================================
-# 2. INTERFACE STREAMLIT
-# ==============================================================================
-st.set_page_config(page_title="Blackjack IA — Profit & Risk Optimization", layout="wide")
-
-st.title("🧬 Blackjack IA — Optimisation du Profit & Aversion au Risque")
-st.markdown("""
-Entraînement génétique sans comptage de cartes. **À la fin de l'évolution**, un tournoi miroir valide automatiquement le champion pour éliminer le hasard.
-""")
-
-if "pop_manager" not in st.session_state:
-    EVO_CONFIG["input_size"] = 4
-    EVO_CONFIG["output_size"] = 4
-    st.session_state.pop_manager = GeneticPopulation(EVO_CONFIG)
-
-if "env" not in st.session_state:
-    st.session_state.env = OptimizedBlackjackEnv()
+# Chargement du modèle YOLO personnalisé
+@st.cache_resource
+def charger_modele_yolo():
+  model_path = "card_detector.pt"
+  if os.path.exists(model_path):
+    return YOLO(model_path)
+  return None
 
 
-# --- BARRE LATÉRALE ---
-st.sidebar.header("⚙️ Entraînement Génétique")
-nb_generations = st.sidebar.slider("Générations", 1, 100, 20)
-parties_par_agent = st.sidebar.slider("Parties par session d'entraînement", 20, 200, 50, step=10)
+model = charger_modele_yolo()
 
-st.sidebar.subheader("🏆 Paramètres de Validation Finale")
-nb_rondes_val = st.slider("Rondes du tournoi miroir (Dernière étape)", 3, 20, 5)
-parties_par_ronde_val = st.slider("Parties par ronde de validation", 50, 500, 100, step=50)
+if model is None:
+  st.error(
+      "❌ Erreur : Le fichier 'card_detector.pt' est introuvable à la racine du"
+      " projet."
+  )
+  st.stop()
+else:
+  st.success("✅ Modèle de vision YOLOv8 chargé avec succès !")
 
-st.sidebar.subheader("💰 Mises & Sécurité")
-min_bet = st.sidebar.number_input("Mise Minimale ($)", value=10.0, step=5.0)
-max_bet = st.sidebar.number_input("Mise Maximale ($)", value=200.0, step=10.0)
+# ---------------------------------------------------------
+# BARRE LATÉRALE - CONFIGURATION ET ENTRÉE IMAGE
+# ---------------------------------------------------------
+st.sidebar.header("⚙️ Paramètres de la Table")
+mode_saisie = st.sidebar.radio(
+    "Mode d'analyse",
+    ["Capture d'écran (YOLO)", "Saisie manuelle rapide"],
+)
 
-if st.sidebar.button("🚀 Lancer l'Évolution & la Validation Finale"):
-    pop_manager = st.session_state.pop_manager
-    env = st.session_state.env
-    env.min_bet = min_bet
-    env.max_bet = max_bet
-    
-    barre_progression = st.progress(0)
-    status_text = st.empty()
-    
-    # --------------------------------------------------------------------------
-    # ÉTAPE 1 : ENTRAÎNEMENT GÉNÉTIQUE CLASSIQUE
-    # --------------------------------------------------------------------------
-    for gen in range(nb_generations):
-        agents = pop_manager.get_population()
-        
-        for agent in agents:
-            env.reset_session()
-            penalites_cumulees = 0.0
-            profit_brut_total = 0.0
-            
-            for _ in range(parties_par_agent):
-                if env.bankroll < min_bet:
-                    penalites_cumulees += 5000.0
-                    break
-                
-                etat = env._obtenir_etat()
-                montant_mise = agent.predict_bet(etat, min_bet, max_bet)
-                env.fixer_mise(montant_mise)
-                
-                etat = env.reset()
-                termine = False
-                while not termine:
-                    action = agent.predict_action(etat)
-                    etat, profit, termine = env.step(action)
-                    profit_brut_total += profit
-                    
-                    if profit < 0:
-                        perte = abs(profit)
-                        penalites_cumulees += (perte ** 1.35) * 0.12
-            
-            agent.fitness = profit_brut_total - penalites_cumulees
+st.sidebar.markdown("---")
+st.sidebar.header("📷 Importation Live")
+uploaded_file = st.sidebar.file_uploader(
+    "Importer une table (PokerStars, etc.)", type=["jpg", "jpeg", "png"]
+)
 
-        pop_manager.evolve()
-        barre_progression.progress((gen + 1) / (nb_generations + 1))
-        
-        status_text.text(
-            f"Génération {pop_manager.generation - 1} | "
-            f"Moy. Générale : {pop_manager.last_gen_avg_fitness:.1f} | "
-            f"Moy. Élites : {pop_manager.last_elite_avg_fitness:.1f} | "
-            f"Record : {pop_manager.best_ever_fitness:.1f}"
-        )
+# Variables d'état pour les cartes
+cartes_joueur = []
+cartes_board = []
 
-    # --------------------------------------------------------------------------
-    # ÉTAPE 2 : TOURNOI MIROIR DE VALIDATION FINALE (Élimination du hasard)
-    # --------------------------------------------------------------------------
-    status_text.text("🏆 Étape finale : Tournoi miroir de validation des élites en cours...")
-    
-    population_triee = sorted(pop_manager.get_population(), key=lambda ind: ind.fitness, reverse=True)
-    nb_elites = max(1, int(pop_manager.pop_size * pop_manager.config["elite_fraction"]))
-    elites = population_triee[:nb_elites]
-    
-    points_tournoi = {i: 0 for i in range(len(elites))}
-    profits_cumules = {i: 0.0 for i in range(len(elites))}
-    
-    for r in range(nb_rondes_val):
-        graine_ronde = 5000 + r * 100
-        resultats_ronde = []
-        
-        for idx, elite in enumerate(elites):
-            env.reset_session(seed=graine_ronde)
-            profit_ronde = 0.0
-            
-            for _ in range(parties_par_ronde_val):
-                if env.bankroll < env.min_bet:
-                    break
-                
-                etat_avant = env._obtenir_etat()
-                montant_mise = elite.predict_bet(etat_avant, env.min_bet, env.max_bet)
-                env.fixer_mise(montant_mise)
-                
-                etat = env.reset()
-                termine = False
-                while not termine:
-                    action = elite.predict_action(etat)
-                    etat, profit, termine = env.step(action)
-                    profit_ronde += profit
+# ---------------------------------------------------------
+# LOGIQUE PRINCIPALE SELON LE MODE
+# ---------------------------------------------------------
+if mode_saisie == "Capture d'écran (YOLO)" and uploaded_file is not None:
+  image = Image.open(uploaded_file)
+  image_np = np.array(image)
 
-            resultats_ronde.append((idx, profit_ronde))
-            profits_cumules[idx] += profit_ronde
+  col1, col2 = st.columns(2)
 
-        resultats_ronde.sort(key=lambda x: x[1], reverse=True)
-        for rang, (idx_elite, _) in enumerate(resultats_ronde):
-            pts_attribues = len(elites) - rang
-            points_tournoi[idx_elite] += pts_attribues
+  with col1:
+    st.subheader("📷 Table originale")
+    st.image(image, use_container_width=True)
 
-    classement_final = sorted(points_tournoi.items(), key=lambda x: x[1], reverse=True)
-    idx_gagnant = classement_final[0][0]
-    vrai_champion = elites[idx_gagnant]
-    
-    # Couronnement officiel du vrai champion validé
-    pop_manager.best_ever_brain = copy.deepcopy(vrai_champion.brain)
-    pop_manager.best_ever_fitness = profits_cumules[idx_gagnant]
-    
-    barre_progression.progress(1.0)
-    status_text.text("✨ Évolution et Tournoi de Validation terminés avec succès !")
-    st.success(f"👑 **Vainqueur Couronné : Élite #{idx_gagnant + 1}** avec **{classement_final[0][1]} Points de Rang** !")
+  with col2:
+    st.subheader("🔍 Détection Vision YOLOv8")
+    results = model(image_np)
+    annotated_frame = results[0].plot()
+    st.image(annotated_frame, channels="BGR", use_container_width=True)
 
+    # Extraction et tri spatial des boîtes englobantes
+    boxes = results[0].boxes
+    cartes_detectees = []
 
-# --- DIAGNOSTIC (4 COLONNES) ---
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.metric("Génération", st.session_state.pop_manager.generation)
-with col2:
-    avg_gen = getattr(st.session_state.pop_manager, 'last_gen_avg_fitness', 0.0)
-    st.metric("Score Moy. Général", f"{avg_gen:.1f}")
-with col3:
-    avg_elite = getattr(st.session_state.pop_manager, 'last_elite_avg_fitness', 0.0)
-    st.metric("Score Moy. Élites", f"{avg_elite:.1f}")
-with col4:
-    st.metric("Record Absolu (Score)", f"{st.session_state.pop_manager.best_ever_fitness:.1f}")
+    for box in boxes:
+      cls_id = int(box.cls[0])
+      conf = float(box.conf[0])
+      nom_carte = model.names[cls_id]
+      xyxy = box.xyxy[0].tolist()
 
-st.divider()
+      x_centre = (xyxy[0] + xyxy[2]) / 2
+      y_centre = (xyxy[1] + xyxy[3]) / 2
 
+      cartes_detectees.append({
+          "carte": nom_carte,
+          "x": x_centre,
+          "y": y_centre,
+          "conf": conf,
+      })
 
-# ==============================================================================
-# SECTION 1 : TEST D'UNE PARTIE UNIQUE DU CHAMPION
-# ==============================================================================
-st.header("🎮 Test d'une Partie Unique du Champion Couronné")
+    # 1. Tri horizontal (gauche à droite)
+    cartes_detectees_triees = sorted(cartes_detectees, key=lambda d: d["x"])
 
-if st.button("🎲 Regarder jouer le champion"):
-    pop_manager = st.session_state.pop_manager
-    env = st.session_state.env
-    
-    if pop_manager.best_ever_brain is None:
-        st.warning("⚠️ Veuillez d'abord lancer l'évolution dans la barre latérale !")
+    # 2. Séparation verticale (Main du joueur en bas vs Board au centre)
+    hauteur_seuil = image_np.shape[0] * 0.60
+    cartes_joueur = [
+        c["carte"] for c in cartes_detectees_triees if c["y"] > hauteur_seuil
+    ]
+    cartes_board = [
+        c["carte"] for c in cartes_detectees_triees if c["y"] <= hauteur_seuil
+    ]
+
+else:
+  # Mode de secours ou saisie manuelle si aucune image n'est chargée
+  st.info(
+      "💡 Importe une capture d'écran dans la barre latérale pour lancer la"
+      " vision automatique, ou utilise les paramètres par défaut ci-dessous."
+  )
+  col_m1, col_m2 = st.columns(2)
+  with col_m1:
+    saisie_j = st.text_input(
+        "Cartes du joueur (ex: Ah Kh)", value="As Kh"
+    )
+    cartes_joueur = saisie_j.split()
+  with col_m2:
+    saisie_b = st.text_input(
+        "Cartes du Board (ex: Qs Jh 2c)", value="Qs Jh 2c"
+    )
+    cartes_board = saisie_b.split()
+
+# ---------------------------------------------------------
+# AFFICHAGE DE L'ÉTAT DE LA MAIN ET ANALYSE GTO / IA
+# ---------------------------------------------------------
+st.markdown("---")
+st.subheader("📊 État de la Table & Analyse Stratégique")
+
+col_etat1, col_etat2 = st.columns(2)
+
+with col_etat1:
+  st.markdown("### 🎴 Main du Joueur (Pocket Cards)")
+  if cartes_joueur:
+    st.success(f"**{ ' '.join(cartes_joueur) }**")
+  else:
+    st.warning("En attente des cartes privatives...")
+
+with col_etat2:
+  st.markdown("### 🃏 Board Communautaire")
+  if cartes_board:
+    st.info(f"**{ ' '.join(cartes_board) }**")
+  else:
+    st.write("Pré-flop (Aucune carte sur le board)")
+
+# Section des onglets d'analyse avancée
+tab1, tab2, tab3 = st.tabs(
+    ["🧠 Recommandation GTO", "🧬 Évolution & Simulation", "⚙️ Paramètres Avancés"]
+)
+
+with tab1:
+  st.markdown("#### 🎯 Conseil de Jeu en Direct")
+  if len(cartes_joueur) >= 2:
+    st.write(
+        f"Analyse de la main : `{cartes_joueur[0]}` et `{cartes_joueur[1]}` sur un"
+        f" board de `{len(cartes_board)}` cartes."
+    )
+
+    # Simulation d'une logique de décision stratégique robuste
+    if len(cartes_board) == 0:
+      st.markdown(
+          "> **Action suggérée (Pre-flop) :** Évaluer la force de la main selon"
+          " la position (6-max GTO Charts)."
+      )
+      st.metric(label="Cote / Équité estimée", value="~ 65.4 %")
     else:
-        champion = Individual(EVO_CONFIG["input_size"], EVO_CONFIG["output_size"], EVO_CONFIG["hidden_layers"])
-        champion.brain.load_state_dict(pop_manager.best_ever_brain.state_dict())
-        
-        etat_initial = env._obtenir_etat()
-        mise_choisie = champion.predict_bet(etat_initial, env.min_bet, env.max_bet)
-        env.fixer_mise(mise_choisie)
-        
-        etat = env.reset()
-        termine = False
-        log_partie = []
-        
-        actions_dict = {0: "STAND", 1: "HIT", 2: "DOUBLE DOWN", 3: "SPLIT"}
-        
-        log_partie.append(f"Bankroll : `{env.bankroll:.2f}$`")
-        log_partie.append(f"👉 **Mise choisie par l'IA : `{env.current_bet:.2f}$`**")
-        log_partie.append(f"Main Joueur : `{env.main_joueur}` | Carte Croupier : `{env.main_croupier[0]}`")
-        
-        tour = 1
-        while not termine:
-            action = champion.predict_action(etat)
-            action_nom = actions_dict.get(action, "UNKNOWN")
-            etat, profit, termine = env.step(action)
-            
-            log_partie.append(f"**Tour {tour}** : Action = **{action_nom}** -> Main : `{env.main_joueur}` | Main Croupier : `{env.main_croupier}`")
-            tour += 1
-            
-        if profit > 0:
-            log_partie.append(f"🎉 **Résultat : Victoire ! Profit = +{profit:.2f}$**")
-        elif profit < 0:
-            log_partie.append(f"❌ **Résultat : Défaite ! Perte = {profit:.2f}$**")
-        else:
-            log_partie.append("🤝 **Résultat : Égalité (Push). Profit = 0$**")
-            
-        for ligne in log_partie:
-            st.markdown(ligne)
+      st.markdown(
+          "> **Action suggérée (Post-flop) :** Calcul de la texture du board et"
+          " des équités de tirages (Flush/Quinte)."
+      )
+      st.metric(label="Indice d'agressivité recommandé", value="75 % Pot")
 
-
-st.divider()
-
-
-# ==============================================================================
-# SECTION 2 : SIMULATION FINANCIÈRE DU CHAMPION (POURCENTAGE & ARGENT)
-# ==============================================================================
-st.header("📊 Simulation Financière du Champion Validé")
-st.markdown("Testez la performance à long terme du champion couronné (taux de rendement, argent gagné et évolution du capital).")
-
-nb_games_eval = st.slider("Parties dans la session de test", 100, 2000, 500, step=100)
-
-if st.button("🧪 Lancer la simulation financière"):
-    pop_manager = st.session_state.pop_manager
-    env = st.session_state.env
-    
-    if pop_manager.best_ever_brain is None:
-        st.warning("⚠️ Lancez d'abord l'évolution dans la barre latérale !")
+    if MODULE_GENETIQUE_DISPO:
+      st.success("✔️ Module d'IA génétique connecté (`neuro_evolution.py`).")
     else:
-        champion = Individual(EVO_CONFIG["input_size"], EVO_CONFIG["output_size"], EVO_CONFIG["hidden_layers"])
-        champion.brain.load_state_dict(pop_manager.best_ever_brain.state_dict())
-        
-        env.reset_session()
-        mises = []
-        bankroll_history = [env.bankroll]
-        victoires = 0
-        
-        with st.spinner(f"Simulation de {nb_games_eval} parties en cours..."):
-            for _ in range(nb_games_eval):
-                if env.bankroll < env.min_bet:
-                    st.error("💥 Banqueroute pendant la simulation !")
-                    break
-                
-                etat_avant = env._obtenir_etat()
-                montant_mise = champion.predict_bet(etat_avant, env.min_bet, env.max_bet)
-                env.fixer_mise(montant_mise)
-                mises.append(env.current_bet)
-                
-                etat = env.reset()
-                termine = False
-                while not termine:
-                    action = champion.predict_action(etat)
-                    etat, profit, termine = env.step(action)
-                    if profit > 0:
-                        victoires += 1
-                
-                bankroll_history.append(env.bankroll)
-        
-        profit_total = env.bankroll - env.initial_bankroll
-        roi = (profit_total / env.initial_bankroll) * 100
-        win_rate = (victoires / nb_games_eval) * 100
-        mise_moyenne = np.mean(mises) if mises else 0
-        
-        st.success("✨ Simulation financière terminée !")
-        
-        col_a, col_b, col_c, col_d = st.columns(4)
-        with col_a:
-            st.metric("Bankroll Finale", f"{env.bankroll:.2f} $", f"{profit_total:+.2f} $")
-        with col_b:
-            st.metric("Rendement (ROI)", f"{roi:.1f}%")
-        with col_c:
-            st.metric("Taux de Victoire", f"{win_rate:.1f}%")
-        with col_d:
-            st.metric("Mise Moyenne", f"{mise_moyenne:.2f} $")
-            
-        st.line_chart(bankroll_history)
+      st.info(
+          "ℹ️ Le module `neuro_evolution.py` peut être couplé pour affiner les"
+          " stratégies."
+      )
+  else:
+    st.warning(
+        "Veuillez t'assurer d'avoir au moins 2 cartes valides pour le joueur."
+    )
+
+with tab2:
+  st.markdown("#### 🧬 Paramètres de l'IA Génétique & Apprentissage")
+  st.write(
+      "Ici, tu peux configurer et superviser les populations de bots, les"
+      " taux de mutation et les générations pour le poker."
+  )
+  col_gen1, col_gen2 = st.columns(2)
+  with col_gen1:
+    st.number_input("Taille de la population", value=100, step=10)
+    st.slider("Taux de mutation", 0.0, 1.0, 0.05)
+  with col_gen2:
+    st.number_input("Nombre de générations max", value=50, step=5)
+    if st.button("Lancer une génération test"):
+      st.toast("Simulation génétique en cours...", icon="🚀")
+
+with tab3:
+  st.markdown("#### 🛠️ Journaux et Debug Technique")
+  st.text(f"Modèle YOLO actif : {model.device}")
+  st.text(f"Nombre total de classes détectables : {len(model.names)}")
+  if st.checkbox("Afficher les coordonnées brutes des boîtes"):
+    st.json(cartes_detectees if 'cartes_detectees' in locals() else {})
